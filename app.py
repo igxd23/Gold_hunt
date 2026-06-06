@@ -457,33 +457,121 @@ def calculate_lead_lag(merged_df):
 
 
 def calculate_fair_value(merged_df, window=100):
-    """Estimates the theoretical Gold price using a rolling linear regression model."""
-    sub_df = merged_df.tail(window)
-    predictors = [c for c in ["DXY", "SILVER", "10Y_YIELD"] if c in sub_df.columns]
+    """Estimates the theoretical Gold price using a multi-factor Ridge regression model.
     
-    if len(predictors) >= 2:
-        X = sub_df[predictors].values
-        X_design = np.hstack([np.ones((X.shape[0], 1)), X])
-        Y = sub_df["GOLD"].values
-        try:
-            beta, _, _, _ = np.linalg.lstsq(X_design, Y, rcond=None)
-            current_X = merged_df[predictors].iloc[-1].values
-            current_X_design = np.append(1.0, current_X)
-            fair_value = float(np.dot(current_X_design, beta))
-            actual_price = float(merged_df["GOLD"].iloc[-1])
-            deviation = actual_price - fair_value
-            
-            # Generate whole series of fair value for chart plotting
-            all_X = merged_df[predictors].values
-            all_X_design = np.hstack([np.ones((all_X.shape[0], 1)), all_X])
-            fair_values_series = np.dot(all_X_design, beta)
-            
-            return fair_value, deviation, fair_values_series
-        except Exception:
-            pass
-            
-    actual_price = float(merged_df["GOLD"].iloc[-1])
-    return actual_price, 0.0, np.full(len(merged_df), actual_price)
+    Features (10 total, all z-score standardised):
+      1-4 : DXY, Silver, 10Y Yield, VIX  (level z-scores)
+      5-7 : DXY 10d return, Silver 10d return, Yield 10d change
+      8   : Gold / Silver ratio
+      9   : Gold 20-day rolling volatility (annualised)
+      10  : Gold 20-day rate-of-change (momentum)
+    
+    Returns: (fair_value, deviation, fair_values_series, residual_std, r_squared, mae)
+    """
+    fallback = (
+        float(merged_df["GOLD"].iloc[-1]),
+        0.0,
+        np.full(len(merged_df), float(merged_df["GOLD"].iloc[-1])),
+        0.0,
+        0.0,
+        0.0,
+    )
+
+    # Need at least 30 rows to build meaningful features
+    if len(merged_df) < 30:
+        return fallback
+
+    required = ["DXY", "SILVER", "10Y_YIELD", "VIX"]
+    available = [c for c in required if c in merged_df.columns]
+    if len(available) < 2:
+        return fallback
+
+    try:
+        # ── Build feature matrix over the FULL dataframe ──────────────────────
+        feat = pd.DataFrame(index=merged_df.index)
+
+        # 1-4: Level z-scores
+        for col in available:
+            mu = merged_df[col].rolling(window, min_periods=20).mean()
+            sigma = merged_df[col].rolling(window, min_periods=20).std() + 1e-8
+            feat[f"{col}_z"] = (merged_df[col] - mu) / sigma
+
+        # 5-7: Momentum returns (10-day pct change)
+        for col in ["DXY", "SILVER", "10Y_YIELD"]:
+            if col in merged_df.columns:
+                feat[f"{col}_mom10"] = merged_df[col].pct_change(10)
+
+        # 8: Gold / Silver ratio (relative valuation)
+        if "SILVER" in merged_df.columns:
+            gs_ratio = merged_df["GOLD"] / (merged_df["SILVER"] + 1e-8)
+            mu_gs = gs_ratio.rolling(window, min_periods=20).mean()
+            sigma_gs = gs_ratio.rolling(window, min_periods=20).std() + 1e-8
+            feat["GS_ratio_z"] = (gs_ratio - mu_gs) / sigma_gs
+
+        # 9: Gold 20-day realised volatility (annualised)
+        gold_ret = merged_df["GOLD"].pct_change()
+        feat["GOLD_vol20"] = gold_ret.rolling(20, min_periods=10).std() * np.sqrt(252)
+
+        # 10: Gold 20-day rate-of-change (momentum)
+        feat["GOLD_roc20"] = merged_df["GOLD"].pct_change(20)
+
+        # Drop rows with NaN (from rolling calcs)
+        feat = feat.replace([np.inf, -np.inf], np.nan)
+        valid_mask = feat.notna().all(axis=1)
+        feat_clean = feat[valid_mask]
+        gold_clean = merged_df["GOLD"][valid_mask]
+
+        if len(feat_clean) < 30:
+            return fallback
+
+        # ── Fit on the last `window` valid rows ───────────────────────────────
+        fit_n = min(window, len(feat_clean))
+        X_fit = feat_clean.iloc[-fit_n:].values
+        Y_fit = gold_clean.iloc[-fit_n:].values
+
+        # Add intercept column
+        X_fit_design = np.hstack([np.ones((X_fit.shape[0], 1)), X_fit])
+        n_features = X_fit_design.shape[1]
+
+        # Ridge regression:  beta = (X'X + lambda*I)^-1 X'y
+        lam = 1.0
+        XtX = X_fit_design.T @ X_fit_design
+        reg_matrix = lam * np.eye(n_features)
+        reg_matrix[0, 0] = 0.0  # Don't regularise the intercept
+        beta = np.linalg.solve(XtX + reg_matrix, X_fit_design.T @ Y_fit)
+
+        # ── Model diagnostics on training window ──────────────────────────────
+        Y_pred_fit = X_fit_design @ beta
+        residuals = Y_fit - Y_pred_fit
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((Y_fit - Y_fit.mean()) ** 2)) + 1e-8
+        r_squared = max(0.0, 1.0 - ss_res / ss_tot)
+        mae = float(np.mean(np.abs(residuals)))
+        residual_std = float(np.std(residuals))
+
+        # ── Predict fair value over the FULL valid range ──────────────────────
+        X_all = feat_clean.values
+        X_all_design = np.hstack([np.ones((X_all.shape[0], 1)), X_all])
+        fv_valid = X_all_design @ beta
+
+        # Map back to the full merged_df index (fill NaN rows with NaN)
+        fair_values_series = np.full(len(merged_df), np.nan)
+        valid_indices = np.where(valid_mask.values)[0]
+        fair_values_series[valid_indices] = fv_valid
+
+        # Forward-fill NaN at the start so the chart doesn't have gaps
+        fv_series = pd.Series(fair_values_series, index=merged_df.index).ffill().bfill()
+        fair_values_series = fv_series.values
+
+        # Current fair value & deviation
+        fair_value = float(fair_values_series[-1])
+        actual_price = float(merged_df["GOLD"].iloc[-1])
+        deviation = actual_price - fair_value
+
+        return fair_value, deviation, fair_values_series, residual_std, r_squared, mae
+
+    except Exception:
+        return fallback
 
 
 def calculate_support_resistance(dfs_raw):
@@ -893,6 +981,8 @@ def draw_html_terminal(data):
     narrative = data["narrative"]
     sr = data["sr"]
     is_demo = data.get("is_demo", False)
+    r_squared = data.get("r_squared", 0.0)
+    mae = data.get("mae", 0.0)
     
     pressure_val = min(max(int((alpha + 100) / 2), 0), 100)
     pressure_label = "Bullish Pressure" if alpha >= 0 else "Bearish Pressure"
@@ -1002,9 +1092,9 @@ def draw_html_terminal(data):
                 </div>
             </div>
             
-            <!-- Fair Value Engine -->
+            <!-- Fair Value Engine (Ridge Regression) -->
             <div class='hermes-card span-4'>
-                <div class='card-title'>Fair Value Engine</div>
+                <div class='card-title'>Fair Value Engine <span style='font-size:9px; color:#64748b; text-transform:none; letter-spacing:0;'>(Ridge · 10-Factor)</span></div>
                 <div class='price-row'>
                     <span class='price-name'>Actual Price</span>
                     <span class='price-val'>{prices['GOLD']:.2f}</span>
@@ -1017,8 +1107,26 @@ def draw_html_terminal(data):
                     <span class='price-name'>Deviation</span>
                     <span class='price-val {"pos-change" if dev>=0 else "neg-change"}'>{dev:+.2f}</span>
                 </div>
-                <div style='margin-top: 16px; text-align: center; font-size: 13px; color: #94a3b8; border-top: 1px solid rgba(255,255,255,0.03); padding-top: 12px;'>
-                    Interpretation: <strong style='color: {"#ef4444" if dev>=0 else "#10b981"};'>Gold trading {"above" if dev>=0 else "below"} fair value.</strong>
+                <div class='price-row'>
+                    <span class='price-name'>Deviation %</span>
+                    <span class='price-val {"pos-change" if dev>=0 else "neg-change"}'>{(dev / (fair_val + 1e-8)) * 100:+.2f}%</span>
+                </div>
+                <div style='margin-top: 12px; display: flex; justify-content: space-between; border-top: 1px solid rgba(255,255,255,0.03); padding-top: 10px;'>
+                    <div>
+                        <span style='color: #64748b; font-size: 10px; font-weight: 700; display:block; text-transform:uppercase;'>R² FIT</span>
+                        <strong style='font-family: "JetBrains Mono", monospace; font-size: 14px; color: {"#10b981" if r_squared >= 0.7 else "#f59e0b" if r_squared >= 0.4 else "#ef4444"};'>{r_squared:.3f}</strong>
+                    </div>
+                    <div>
+                        <span style='color: #64748b; font-size: 10px; font-weight: 700; display:block; text-transform:uppercase;'>MAE ($)</span>
+                        <strong style='font-family: "JetBrains Mono", monospace; font-size: 14px; color: #cbd5e1;'>{mae:.1f}</strong>
+                    </div>
+                    <div style='text-align: right;'>
+                        <span style='color: #64748b; font-size: 10px; font-weight: 700; display:block; text-transform:uppercase;'>QUALITY</span>
+                        <strong style='font-size: 12px; padding: 2px 8px; border-radius: 4px; background: {"rgba(16,185,129,0.15)" if r_squared >= 0.7 else "rgba(245,158,11,0.15)" if r_squared >= 0.4 else "rgba(239,68,68,0.15)"}; color: {"#10b981" if r_squared >= 0.7 else "#f59e0b" if r_squared >= 0.4 else "#ef4444"};'>{"STRONG" if r_squared >= 0.7 else "FAIR" if r_squared >= 0.4 else "WEAK"}</strong>
+                    </div>
+                </div>
+                <div style='margin-top: 10px; text-align: center; font-size: 12px; color: #94a3b8;'>
+                    <strong style='color: {"#ef4444" if dev>=0 else "#10b981"};'>Gold trading {"above" if dev>=0 else "below"} fair value.</strong>
                 </div>
             </div>
             
@@ -1202,7 +1310,7 @@ with tab_terminal:
                 
             # Run calculation modules
             lead_lag = calculate_lead_lag(merged_df)
-            fair_val, dev, fair_value_series = calculate_fair_value(merged_df)
+            fair_val, dev, fair_value_series, residual_std, r_squared, mae = calculate_fair_value(merged_df)
             sr = calculate_support_resistance(dfs_raw)
             alpha, shap_pcts, shap_signs = calculate_alpha_and_shap(merged_df, dfs_raw)
             regimes, confidence = detect_regimes_and_confidence(merged_df, alpha)
@@ -1222,7 +1330,9 @@ with tab_terminal:
                 "confidence": confidence,
                 "narrative": narrative,
                 "sr": sr,
-                "is_demo": is_demo
+                "is_demo": is_demo,
+                "r_squared": r_squared,
+                "mae": mae
             }
             
             # Draw Bloomberg-style Grid
@@ -1297,7 +1407,7 @@ with tab_research:
             merged_df, dfs_raw, is_demo = fetch_aligned_data(period=selected_period)
 
             # Run calculations needed for research plots
-            fair_val, dev, fair_value_series = calculate_fair_value(merged_df)
+            fair_val, dev, fair_value_series, residual_std, r_squared, mae = calculate_fair_value(merged_df)
             corr_matrix = merged_df.corr()
 
             # ── Normalized Multi-Asset Chart ─────────────────────────────────────
@@ -1351,6 +1461,25 @@ with tab_research:
                     unsafe_allow_html=True
                 )
                 fig_fv = go.Figure()
+
+                # ±1σ Confidence band
+                if residual_std > 0:
+                    upper_band = fair_value_series + residual_std
+                    lower_band = fair_value_series - residual_std
+                    fig_fv.add_trace(go.Scatter(
+                        x=merged_df.index, y=upper_band,
+                        mode='lines', line=dict(width=0),
+                        showlegend=False, hoverinfo='skip'
+                    ))
+                    fig_fv.add_trace(go.Scatter(
+                        x=merged_df.index, y=lower_band,
+                        mode='lines', line=dict(width=0),
+                        fill='tonexty',
+                        fillcolor='rgba(56,189,248,0.08)',
+                        name='±1σ Band',
+                        hoverinfo='skip'
+                    ))
+
                 fig_fv.add_trace(go.Scatter(
                     x=merged_df.index,
                     y=merged_df['GOLD'],
@@ -1362,7 +1491,7 @@ with tab_research:
                     x=merged_df.index,
                     y=fair_value_series,
                     mode='lines',
-                    name='Rolling OLS Fair Value',
+                    name=f'Ridge Fair Value (R²={r_squared:.2f})',
                     line=dict(color='#38bdf8', width=1.8, dash='dash')
                 ))
                 fig_fv.update_layout(
